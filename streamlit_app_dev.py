@@ -19,7 +19,11 @@ except Exception:
 
 BASE_DIR = os.path.dirname(__file__)
 
+# Baseline model is still used for timing recommendations.
 MODEL_PATH = os.path.join(BASE_DIR, "xgb_pipeline_ag_bat.joblib")
+
+# Primary pricing model for the dealer-facing dashboard.
+NLP_MODEL_PATH = os.path.join(BASE_DIR, "xgb_pipeline_ag_bat_nlp_compare.joblib")
 DATA_PATH = os.path.join(BASE_DIR, "final_predictions_clean_with_corrected_mileage.csv")
 
 DOW_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
@@ -53,6 +57,13 @@ def format_date_dMY(d):
 def load_model():
     return joblib.load(MODEL_PATH)
 
+
+@st.cache_resource
+def load_nlp_model():
+    """Load the experimental NLP-enhanced model if available."""
+    if not os.path.exists(NLP_MODEL_PATH):
+        return None
+    return joblib.load(NLP_MODEL_PATH)
 
 @st.cache_data
 def load_training_stats(csv_path):
@@ -191,9 +202,26 @@ def set_page_style():
     st.markdown(
         """
         <style>
-            body { background-color: #000; color: #fff; }
-            .main { background-color: #000; }
+            body { background-color: #000; color: #f9f9f9; }
+            .main { background-color: #000; color: #f9f9f9; }
             h1, h2, h3, h4 { color: #f7941d; }
+
+            /* Make all regular text brighter and slightly bolder for readability */
+            p, li, span, label, .stText, .stMarkdown, .stRadio, .stSelectbox, .stSlider {
+                color: #f2f2f2 !important;
+                font-weight: 500;
+            }
+
+            /* Research expander styling */
+            div[data-testid="stExpander"] {
+                border-radius: 12px;
+                border: 1px solid #f7941d;
+            }
+            div[data-testid="stExpander"] div[data-testid="stExpanderHeader"] p {
+                color: #f7941d !important;
+                font-size: 1.0rem;
+                font-weight: 700;
+            }
 
             .avant-card {
                 background-color: #111;
@@ -206,8 +234,17 @@ def set_page_style():
                 font-weight: 800;
                 color: #f7941d;
             }
-            .avant-subtitle { color: #ccc; font-size: 0.95rem; }
-            .avant-small { color: #bbb; font-size: 0.95rem; line-height: 1.35; }
+            .avant-subtitle {
+                color: #f5f5f5;
+                font-size: 0.98rem;
+                font-weight: 600;
+            }
+            .avant-small {
+                color: #f0f0f0;
+                font-size: 0.96rem;
+                line-height: 1.45;
+                font-weight: 500;
+            }
 
             .stButton>button {
                 background-color: #f7941d; color: black;
@@ -307,6 +344,68 @@ def recommend_best_timing(row_base: dict, model, horizon_days=HORIZON_DAYS, tole
     return chosen, top5
 
 
+def _compute_listing_text_features(listing_text: str, mileage_value: int) -> dict:
+    """
+    Derive simple keyword and domain features from free-text listing details.
+
+    Mirrors the training-time features used in the NLP-enhanced comparison model.
+    """
+    text = (listing_text or "").lower()
+    # Normalize whitespace similar to training cleanup
+    text = " ".join(text.split())
+
+    manual_transmission = int("manual" in text)
+
+    turbo_engine = int(
+        ("turbocharged" in text)
+        or ("twin-turbo" in text)
+        or ("turbo engine" in text)
+    )
+
+    limited_slip_diff = int("limited-slip" in text)
+    service_records = int("service records" in text)
+    clean_carfax = int("clean carfax" in text)
+    sport_package = int("sport chrono" in text)
+
+    ceramic_brakes = int(
+        ("ceramic brakes" in text)
+        or ("pccb" in text)
+        or ("carbon-ceramic" in text)
+    )
+
+    pdk_transmission = int("pdk" in text)
+    bucket_seats = int(
+        ("bucket seats" in text) or ("full bucket seats" in text)
+    )
+
+    color_guards_red = int("guards red" in text)
+    color_grand_prix_white = int("grand prix white" in text)
+    color_speed_yellow = int("speed yellow" in text)
+
+    rare_color = int(
+        color_guards_red or color_grand_prix_white or color_speed_yellow
+    )
+
+    low_mileage = int(mileage_value is not None and mileage_value < 30000)
+
+    return {
+        "manual_transmission": manual_transmission,
+        "turbo_engine": turbo_engine,
+        "limited_slip_diff": limited_slip_diff,
+        "service_records": service_records,
+        "clean_carfax": clean_carfax,
+        "sport_package": sport_package,
+        "ceramic_brakes": ceramic_brakes,
+        "pdk_transmission": pdk_transmission,
+        "bucket_seats": bucket_seats,
+        "color_guards_red": color_guards_red,
+        "color_grand_prix_white": color_grand_prix_white,
+        "color_speed_yellow": color_speed_yellow,
+        "rare_color": rare_color,
+        "low_mileage": low_mileage,
+    }
+
+
 # ------------------------------------------------------------------
 # APP
 # ------------------------------------------------------------------
@@ -314,7 +413,10 @@ def recommend_best_timing(row_base: dict, model, horizon_days=HORIZON_DAYS, tole
 def main():
     set_page_style()
 
+    # Baseline model: internal use for timing.
     model = load_model()
+    # NLP-enhanced model: primary pricing model for dealers.
+    nlp_model = load_nlp_model()
 
     (
         med_lat, med_lon,
@@ -393,6 +495,15 @@ def main():
         )
 
         zipcode = st.text_input("Seller ZIP Code", "85260")
+
+        listing_details_text = st.text_area(
+            "Listing details (optional)",
+            help=(
+                "Paste the auction or dealer description to enable the "
+                "experimental NLP-enhanced estimate."
+            ),
+            height=140,
+        )
 
         st.markdown("#### Expected engagement (demand signal)")
 
@@ -480,11 +591,24 @@ Use **Average** as a baseline. Select **Low** when demand feels softer or season
         }
 
         row_today = pd.DataFrame([base_row])
-        predicted_price_today = float(model.predict(row_today)[0])
+
+        # Price estimate from NLP-enhanced model when available.
+        nlp_features = _compute_listing_text_features(
+            listing_details_text, int(mileage)
+        )
+        row_for_price = pd.DataFrame([{**base_row, **nlp_features}])
+
+        if nlp_model is not None:
+            predicted_price_today = float(nlp_model.predict(row_for_price)[0])
+        else:
+            # Fallback to baseline if NLP model artifact is missing.
+            predicted_price_today = float(model.predict(row_today)[0])
 
         best, top5 = recommend_best_timing(base_row, model)
         best_date_str = format_date_dMY(best["_date"])
         best_dow = DOW_NAMES[int(best["auction_dow"])]
+
+        st.markdown("#### Estimated sold price")
 
         c1, c2, c3 = st.columns([1.3, 1, 1])
 
@@ -509,6 +633,16 @@ Accidents reported: **{accident_choice}**.
             """
         )
 
+        if listing_details_text and listing_details_text.strip():
+            st.markdown(
+                "<div class='avant-small'>"
+                "This estimate incorporates text-derived signals from the "
+                "listing details (manual gearbox, Turbo/PCCB, colors, "
+                "service records, and more)."
+                "</div>",
+                unsafe_allow_html=True,
+            )
+
         st.markdown(f"#### Top 5 predicted close dates (next {HORIZON_DAYS} days)")
         top5 = top5.reset_index(drop=True)
         st.dataframe(top5, use_container_width=True, hide_index=True)
@@ -520,6 +654,109 @@ Accidents reported: **{accident_choice}**.
         )
 
     st.markdown("</div>", unsafe_allow_html=True)
+
+    # ---------------- RESEARCH & MODEL INSIGHTS (HIDDEN BY DEFAULT) ----------------
+    with st.expander("Research & model insights (for analysts and technical readers)", expanded=False):
+        st.markdown("<div class='avant-card'>", unsafe_allow_html=True)
+        st.markdown("### 1. Model overview", unsafe_allow_html=False)
+        st.markdown(
+            """
+- **Target**: sold price on BaT-style Porsche 911 auctions (future work: Avant-Garde sales).
+- **Structured inputs**: year, mileage, submodel, number of owners, accidents, ZIP / latitude / longitude, views, watchers, comments, timing.
+- **Text‑derived inputs**: gearbox (manual vs PDK), Turbo keywords, PCCB / ceramic brakes, Sport Chrono, bucket seats, rare colors (Guards Red, Grand Prix White, Speed Yellow), low mileage, service records, clean Carfax, and a combined rare‑color flag.
+- **Takeaway**: combining **structured + listing text** outperforms structured data alone on holdout auctions.
+            """
+        )
+
+        perf_data = pd.DataFrame(
+            [
+                {
+                    "Model": "Baseline (structured only)",
+                    "RMSE": 34361,
+                    "MAE": 18825,
+                    "R2": 0.823,
+                },
+                {
+                    "Model": "NLP-enhanced (with listing text)",
+                    "RMSE": 32319,
+                    "MAE": 17940,
+                    "R2": 0.844,
+                },
+            ]
+        )
+
+        st.markdown("### 2. Performance comparison (baseline vs NLP)")
+        st.markdown("#### Holdout performance (BaT data)")
+        st.dataframe(perf_data, use_container_width=True, hide_index=True)
+
+        st.markdown("#### RMSE comparison")
+        rmse_df = perf_data[["Model", "RMSE"]].set_index("Model")
+        st.bar_chart(rmse_df)
+
+        st.markdown(
+            "- **RMSE improvement**: NLP reduces RMSE by ~6% and MAE by ~5% on the 20% holdout set.\n"
+            "- **Interpretation**: listing descriptions provide incremental signal beyond year / mileage / engagement."
+        )
+
+        st.markdown("### 3. Feature importance & domain insights")
+
+        if nlp_model is not None:
+            try:
+                prep = nlp_model.named_steps["prep"]
+                feature_names = prep.get_feature_names_out()
+                importances = nlp_model.named_steps["model"].feature_importances_
+                fi = (
+                    pd.Series(importances, index=feature_names)
+                    .sort_values(ascending=False)
+                    .head(20)
+                )
+
+                st.markdown("#### Top features in the NLP-enhanced model")
+                st.bar_chart(fi.sort_values(ascending=True))
+
+                st.markdown(
+                    """
+- **Low mileage & rare colors**: low mileage, Guards Red, Grand Prix White, and Speed Yellow show strong positive influence.
+- **Text signals**: Turbo / GT cars with PCCB, Sport Chrono, and bucket seats command significant premiums.
+- **Engagement vs spec**: listing spec and provenance features (gearbox, brakes, color, service history) complement engagement (views / watchers / comments).
+                    """
+                )
+            except Exception:
+                st.markdown(
+                    "<div class='avant-small'>Unable to display feature importance "
+                    "for the current NLP model artifact.</div>",
+                    unsafe_allow_html=True,
+                )
+        else:
+            st.markdown(
+                "<div class='avant-small'>NLP-enhanced model artifact not found; "
+                "research charts are based on the last recorded metrics.</div>",
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("### 5. Data & methodology notes")
+        st.markdown(
+            """
+- **Data source**: Bring a Trailer Porsche 911 auction dataset (Kaggle export), filtered to clean sales with usable pricing and mileage.
+- **Split**: 80/20 train/holdout with a fixed random seed for reproducibility.
+- **Model**: XGBoost regressor wrapped in a scikit-learn pipeline with one‑hot encoding for `submodel` and passthrough numeric features.
+- **Limitations**:
+  - BaT buyer base and presentation standards may differ from Avant-Garde.
+  - Text features are keyword‑based (not a full language model).
+  - No private-sale data or off‑platform transactions are captured.
+            """
+        )
+
+        st.markdown("### 6. Roadmap / future work")
+        st.markdown(
+            """
+- **Avant-Garde data**: scrape and integrate Avant-Garde Porsche sales to fine‑tune the model on in‑house inventory.
+- **Richer text modeling**: move from keyword features to embeddings / transformer‑based text encoders.
+- **Calibration & monitoring**: calibrate predictions to realized prices and monitor drift over time as market conditions change.
+            """
+        )
+
+        st.markdown("</div>", unsafe_allow_html=True)
 
     # ---------------- FOOTER ----------------
     st.markdown("<br><br>", unsafe_allow_html=True)
