@@ -9,6 +9,7 @@ The original **structured-only V1** implementation lives in a separate repo (`po
 
 ![AI System Architecture](AI%20System%20Architecture.png)
 
+
 ## Run locally
 
 ```bash
