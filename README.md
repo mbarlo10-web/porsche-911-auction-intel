@@ -7,6 +7,8 @@ ML-powered price advisor for Porsche 911 auctions. Uses an XGBoost model trained
 This repository is the **V2, NLP-enhanced** version of the project.  
 The original **structured-only V1** implementation lives in a separate repo (`porsche-auction-intel`) and is kept for history/comparison.
 
+![AI System Architecture](AI System Architecture.png)
+
 ## Run locally
 
 ```bash
